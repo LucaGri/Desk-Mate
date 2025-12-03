@@ -1,0 +1,48 @@
+PHASE 3: Update Database and Profile Language Selector
+Estimated time: 5 minutes | Risk: Low
+Step 3.1: Update database ENUM for locale
+Run this SQL in Supabase SQL Editor:
+sql-- Add new locale values to allow all 5 languages
+ALTER TABLE public.profiles 
+ALTER COLUMN locale TYPE TEXT;
+
+-- Update the column comment
+COMMENT ON COLUMN public.profiles.locale IS 'User language: en, it, de, fr, es';
+Step 3.2: Update supabase-types.ts
+In client/src/lib/supabase-types.ts, update the locale options in the Profile interface if needed. The locale field should accept: 'en', 'it', 'de', 'fr', 'es'.
+Step 3.3: Update Profile Language Selector
+In client/src/pages/profile.tsx, find the language selector section (around line 1007-1033) and update it:
+Find this code:
+tsx<SelectContent>
+  <SelectItem value="it" data-testid="option-locale-it">Italiano</SelectItem>
+  <SelectItem value="en" data-testid="option-locale-en">English</SelectItem>
+</SelectContent>
+Replace with:
+tsx<SelectContent>
+  <SelectItem value="en" data-testid="option-locale-en">English</SelectItem>
+  <SelectItem value="it" data-testid="option-locale-it">Italiano</SelectItem>
+  <SelectItem value="de" data-testid="option-locale-de">Deutsch</SelectItem>
+  <SelectItem value="fr" data-testid="option-locale-fr">Français</SelectItem>
+  <SelectItem value="es" data-testid="option-locale-es">Español</SelectItem>
+</SelectContent>
+Step 3.4: Create language change hook
+In client/src/lib/i18n.ts, add a function to change language:
+typescript// Add at the end of the file
+export const changeLanguage = (locale: string) => {
+  i18n.changeLanguage(locale);
+  localStorage.setItem('i18nextLng', locale);
+};
+Step 3.5: Connect profile save to language change
+In client/src/pages/profile.tsx, import the changeLanguage function and call it when saving:
+Add import:
+typescriptimport { changeLanguage } from '@/lib/i18n';
+In the saveProfile function, after successful save, add:
+typescript// After: applyTheme(data.theme);
+changeLanguage(data.locale);
+
+✅ Phase 3 Verification
+
+Go to Profile page
+Language selector should show 5 languages
+Change language and save
+App should remember the selected language on refresh

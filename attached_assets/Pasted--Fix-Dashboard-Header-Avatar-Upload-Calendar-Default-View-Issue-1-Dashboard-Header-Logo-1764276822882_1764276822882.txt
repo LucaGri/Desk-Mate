@@ -1,0 +1,163 @@
+# Fix: Dashboard Header + Avatar Upload + Calendar Default View
+
+## Issue 1: Dashboard Header Logo
+
+**File:** `client/src/pages/dashboard.tsx`
+
+Find this code in the header (around line 77-80):
+```tsx
+<div className="flex items-center gap-2">
+  <img src="/logo.png" alt="Desk Mate" className="h-8" />
+  <h1 className="text-xl font-bold" data-testid="text-app-title">Desk-Mate</h1>
+</div>
+```
+
+**Replace with:**
+```tsx
+<img 
+  src="/logo.png" 
+  alt="Desk Mate" 
+  className="h-12 cursor-pointer hover:opacity-80 transition-opacity" 
+  onClick={() => setLocation("/")}
+  data-testid="logo-home"
+/>
+```
+
+**Changes:**
+- Logo larger: `h-8` → `h-12`
+- Added click handler to navigate home
+- Added hover effect
+- Removed "Desk-Mate" text and wrapper div
+
+---
+
+## Issue 2: Avatar Upload Error 400
+
+**File:** `client/src/pages/profile.tsx`
+
+Find the `handleAvatarUpload` function (around line 244-311).
+
+**Current code (line 273-275):**
+```tsx
+const { error: uploadError } = await supabase.storage
+  .from('avatars')
+  .upload(filePath, file, { upsert: true });
+```
+
+**Replace with:**
+```tsx
+// Delete existing avatar first to avoid conflicts
+const { data: existingFiles } = await supabase.storage
+  .from('avatars')
+  .list(user.id);
+
+if (existingFiles && existingFiles.length > 0) {
+  const filesToDelete = existingFiles.map(f => `${user.id}/${f.name}`);
+  await supabase.storage.from('avatars').remove(filesToDelete);
+}
+
+// Upload new avatar with explicit contentType
+const { error: uploadError } = await supabase.storage
+  .from('avatars')
+  .upload(filePath, file, { 
+    upsert: true,
+    contentType: file.type,
+    cacheControl: '3600',
+  });
+```
+
+**Why this fixes the 400 error:**
+- Adds explicit `contentType: file.type` which Supabase requires
+- Adds `cacheControl` for proper caching
+- Deletes old avatar first to prevent conflicts
+
+---
+
+## Issue 3: Verify Storage Bucket Policies (Run in Supabase SQL Editor)
+
+If avatar upload still fails after code fix, run this SQL:
+```sql
+-- Verify bucket exists
+SELECT * FROM storage.buckets WHERE id = 'avatars';
+
+-- If empty, create bucket:
+INSERT INTO storage.buckets (id, name, public, file_size_limit, allowed_mime_types)
+VALUES (
+    'avatars',
+    'avatars',
+    true,
+    5242880,
+    ARRAY['image/jpeg', 'image/png', 'image/webp', 'image/gif']
+)
+ON CONFLICT (id) DO UPDATE SET
+    public = true,
+    file_size_limit = 5242880,
+    allowed_mime_types = ARRAY['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+
+-- Recreate storage policies (drop and recreate to avoid conflicts)
+DROP POLICY IF EXISTS "Users can upload own avatar" ON storage.objects;
+DROP POLICY IF EXISTS "Users can update own avatar" ON storage.objects;
+DROP POLICY IF EXISTS "Users can delete own avatar" ON storage.objects;
+DROP POLICY IF EXISTS "Anyone can view avatars" ON storage.objects;
+
+CREATE POLICY "Users can upload own avatar"
+    ON storage.objects FOR INSERT
+    WITH CHECK (bucket_id = 'avatars' AND auth.uid()::text = (storage.foldername(name))[1]);
+
+CREATE POLICY "Users can update own avatar"
+    ON storage.objects FOR UPDATE
+    USING (bucket_id = 'avatars' AND auth.uid()::text = (storage.foldername(name))[1]);
+
+CREATE POLICY "Users can delete own avatar"
+    ON storage.objects FOR DELETE
+    USING (bucket_id = 'avatars' AND auth.uid()::text = (storage.foldername(name))[1]);
+
+CREATE POLICY "Anyone can view avatars"
+    ON storage.objects FOR SELECT
+    USING (bucket_id = 'avatars');
+```
+
+---
+
+## Issue 4: Apply Default Calendar View on Calendar Page
+
+**File:** `client/src/pages/calendar.tsx`
+
+The profile already saves `default_calendar_view`. Now ensure the calendar uses it.
+
+**Find the calendar view state initialization** (look for something like):
+```tsx
+const [currentView, setCurrentView] = useState<'day' | 'week' | 'month'>('week');
+```
+
+**Replace with:**
+```tsx
+const { profile } = useAuth();
+
+const [currentView, setCurrentView] = useState<'day' | 'week' | 'month'>(
+  profile?.default_calendar_view || 'week'
+);
+
+// Add useEffect to update view when profile loads
+useEffect(() => {
+  if (profile?.default_calendar_view && !hasUserChangedView) {
+    setCurrentView(profile.default_calendar_view);
+  }
+}, [profile?.default_calendar_view]);
+```
+
+**If calendar uses a different state management**, ensure:
+1. Import `useAuth` from `@/contexts/AuthContext`
+2. Get `profile` from useAuth
+3. Use `profile.default_calendar_view` as initial value
+
+---
+
+## Summary
+
+| Issue | File | Line(s) | Change |
+|-------|------|---------|--------|
+| Logo larger + home link | `dashboard.tsx` | ~77-80 | `h-8`→`h-12`, add onClick, remove h1 |
+| Avatar upload 400 | `profile.tsx` | 273-275 | Add `contentType: file.type` |
+| Storage policies | Supabase SQL | - | Run SQL to verify/create policies |
+| Calendar default view | `calendar.tsx` | state init | Use `profile.default_calendar_view` |

@@ -1,0 +1,69 @@
+Build an onboarding wizard for desk-mate.it that appears only on first login.
+
+WHAT I NEED:
+A 3-step wizard that collects user preferences and saves them to Supabase.
+
+WIZARD STEPS:
+
+Step 1 - Welcome & Personal Info:
+- Title: "Welcome to Desk-Mate!"
+- Full name (input, pre-filled from Google if available)
+- Timezone (select dropdown, default: Europe/Rome)
+- Locale selector (EN / IT toggle, default: detected language)
+- "Continue" button
+
+Step 2 - Calendar Preferences:
+- Title: "Set your calendar preferences"
+- Work hours start (time select, default: 09:00)
+- Work hours end (time select, default: 18:00)
+- Work days (checkboxes: Mon-Sun, default: Mon-Fri checked)
+- Default calendar view (radio buttons: Day / Week / Month, default: Week)
+- "Continue" button
+
+Step 3 - Ready:
+- Title: "You're all set!"
+- Success message
+- "Start using Desk-Mate" button
+
+FLOW:
+1. User logs in → Check profiles.onboarding_completed
+2. If false → Show onboarding wizard at /onboarding
+3. If true → Redirect to /dashboard/calendar
+4. On final step submit:
+   - Update profiles: full_name, timezone, locale, onboarding_completed = true
+   - Update user_settings: work_hours_start, work_hours_end, work_days, calendar_view_default
+   - Redirect to /dashboard/calendar
+
+PROTECTION:
+- Route must check auth (redirect to login if not authenticated)
+- If onboarding already completed → redirect to dashboard
+
+DESIGN:
+- Clean, centered card layout
+- Progress indicator (step 1/3, 2/3, 3/3)
+- Mobile responsive
+- Use shadcn/ui components (Card, Input, Select, Button, Checkbox, RadioGroup)
+
+SUPABASE:
+Database already configured with tables:
+- profiles (id, email, full_name, timezone, locale, onboarding_completed)
+- user_settings (user_id, work_hours_start, work_hours_end, work_days, calendar_view_default)
+
+ENVIRONMENT:
+NEXT_PUBLIC_SUPABASE_URL=https://thvhmbbzylvlazseqndv.supabase.co
+NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRodmhtYmJ6eWx2bGF6c2VxbmR2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQwMDAwMzcsImV4cCI6MjA3OTU3NjAzN30.jfvt-tR7-rnZtK-wmeGnbbMQ_OVLukCqY8Bx6Yz3_R4
+
+FILES TO CREATE:
+- app/onboarding/page.tsx (main wizard)
+- components/onboarding/wizard-step1.tsx
+- components/onboarding/wizard-step2.tsx
+- components/onboarding/wizard-step3.tsx
+- components/onboarding/progress-indicator.tsx
+
+TECH STACK:
+- Next.js 14 App Router
+- TypeScript
+- TailwindCSS + shadcn/ui
+- Supabase client (already set up from previous prompt)
+
+Make it work end-to-end: after completing onboarding, user should land on /dashboard/calendar (even if it's a placeholder page for now).

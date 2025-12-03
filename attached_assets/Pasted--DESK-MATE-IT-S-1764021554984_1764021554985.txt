@@ -1,0 +1,990 @@
+-- ============================================================================
+-- DESK-MATE.IT - SUPABASE DATABASE SCHEMA
+-- ============================================================================
+-- Version: 1.0 MVP
+-- Date: 2024-11-24
+-- Features: Calendar, Meetings, Guest Users, AI Features, Journaling
+-- Schema: Dedicated API (api schema for exposed tables)
+-- ============================================================================
+
+-- ============================================================================
+-- EXTENSIONS
+-- ============================================================================
+
+-- Enable UUID generation
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
+-- Enable pgcrypto for token generation
+CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+
+-- ============================================================================
+-- ENUMS (Define first, used by tables)
+-- ============================================================================
+
+-- Event types
+CREATE TYPE event_type AS ENUM ('meeting', 'task', 'personal', 'imported', 'journal');
+
+-- Event source
+CREATE TYPE event_source AS ENUM ('manual', 'google', 'apple');
+
+-- Meeting status
+CREATE TYPE meeting_status AS ENUM ('scheduled', 'live', 'ended', 'cancelled');
+
+-- Participant type
+CREATE TYPE participant_type AS ENUM ('host', 'participant', 'guest');
+
+-- Processing status
+CREATE TYPE processing_status AS ENUM ('pending', 'processing', 'completed', 'failed');
+
+-- Task priority
+CREATE TYPE task_priority AS ENUM ('low', 'medium', 'high');
+
+-- Task status
+CREATE TYPE task_status AS ENUM ('pending', 'in_progress', 'completed', 'cancelled');
+
+-- Mood levels
+CREATE TYPE mood_level AS ENUM ('terrible', 'bad', 'neutral', 'good', 'great');
+
+-- Calendar view
+CREATE TYPE calendar_view AS ENUM ('day', 'week', 'month', 'agenda');
+
+-- Theme
+CREATE TYPE theme_option AS ENUM ('light', 'dark', 'auto');
+
+-- ============================================================================
+-- SCHEMA: public (Internal tables, NOT exposed via API)
+-- ============================================================================
+
+-- ----------------------------------------------------------------------------
+-- 1. USER PROFILES (extends auth.users)
+-- ----------------------------------------------------------------------------
+CREATE TABLE public.profiles (
+    id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+    email TEXT NOT NULL UNIQUE,
+    full_name TEXT,
+    avatar_url TEXT,
+    timezone TEXT DEFAULT 'Europe/Rome' NOT NULL,
+    locale TEXT DEFAULT 'it' NOT NULL CHECK (locale IN ('it', 'en')),
+    onboarding_completed BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+);
+
+-- Auto-create profile on user signup
+CREATE OR REPLACE FUNCTION public.handle_new_user()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO public.profiles (id, email, full_name, avatar_url)
+    VALUES (
+        NEW.id,
+        NEW.email,
+        NEW.raw_user_meta_data->>'full_name',
+        NEW.raw_user_meta_data->>'avatar_url'
+    );
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE TRIGGER on_auth_user_created
+    AFTER INSERT ON auth.users
+    FOR EACH ROW EXECUTE FUNCTION public.handle_new_user();
+
+-- ----------------------------------------------------------------------------
+-- 2. USER SETTINGS
+-- ----------------------------------------------------------------------------
+CREATE TABLE public.user_settings (
+    user_id UUID PRIMARY KEY REFERENCES public.profiles(id) ON DELETE CASCADE,
+    
+    -- Calendar preferences
+    calendar_view_default calendar_view DEFAULT 'week',
+    work_hours_start TIME DEFAULT '09:00:00',
+    work_hours_end TIME DEFAULT '18:00:00',
+    work_days INTEGER[] DEFAULT ARRAY[1,2,3,4,5], -- Monday to Friday
+    
+    -- Meeting defaults
+    auto_record_meetings BOOLEAN DEFAULT false,
+    auto_transcribe BOOLEAN DEFAULT false,
+    ai_summaries_enabled BOOLEAN DEFAULT true,
+    default_meeting_duration INTEGER DEFAULT 30, -- minutes
+    
+    -- Notifications (JSONB for flexibility)
+    notifications_enabled JSONB DEFAULT '{
+        "meeting_reminders": true,
+        "recording_ready": true,
+        "task_due": true,
+        "daily_journal_prompt": true,
+        "email_notifications": true
+    }'::jsonb,
+    
+    -- UI preferences
+    theme theme_option DEFAULT 'auto',
+    
+    updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+);
+
+-- Auto-create settings on profile creation
+CREATE OR REPLACE FUNCTION public.handle_new_profile()
+RETURNS TRIGGER AS $$
+BEGIN
+    INSERT INTO public.user_settings (user_id)
+    VALUES (NEW.id);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE TRIGGER on_profile_created
+    AFTER INSERT ON public.profiles
+    FOR EACH ROW EXECUTE FUNCTION public.handle_new_profile();
+
+-- ----------------------------------------------------------------------------
+-- 3. CALENDAR EVENTS
+-- ----------------------------------------------------------------------------
+CREATE TABLE public.calendar_events (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+    
+    -- Event details
+    title TEXT NOT NULL,
+    description TEXT,
+    location TEXT,
+    
+    -- Timing
+    start_time TIMESTAMPTZ NOT NULL,
+    end_time TIMESTAMPTZ NOT NULL,
+    all_day BOOLEAN DEFAULT false,
+    timezone TEXT DEFAULT 'Europe/Rome',
+    
+    -- Categorization
+    event_type event_type DEFAULT 'personal',
+    source event_source DEFAULT 'manual',
+    color_tag TEXT, -- hex color for UI
+    tags TEXT[],
+    
+    -- Recurrence (RRULE format: https://icalendar.org/iCalendar-RFC-5545/3-8-5-3-recurrence-rule.html)
+    recurrence_rule TEXT, -- e.g., "FREQ=WEEKLY;BYDAY=MO,WE,FR"
+    recurrence_exception_dates TIMESTAMPTZ[], -- dates to exclude
+    parent_event_id UUID REFERENCES public.calendar_events(id), -- if this is an instance of recurring event
+    
+    -- External sync
+    google_event_id TEXT,
+    google_calendar_id TEXT,
+    
+    -- Metadata
+    is_deleted BOOLEAN DEFAULT false,
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    
+    -- Constraints
+    CONSTRAINT valid_time_range CHECK (end_time > start_time)
+);
+
+-- ----------------------------------------------------------------------------
+-- 4. GOOGLE CALENDAR SYNC
+-- ----------------------------------------------------------------------------
+CREATE TABLE public.google_calendar_sync (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+    
+    google_calendar_id TEXT NOT NULL,
+    calendar_name TEXT NOT NULL,
+    is_primary BOOLEAN DEFAULT false,
+    sync_enabled BOOLEAN DEFAULT true,
+    
+    -- Sync state
+    last_sync_at TIMESTAMPTZ,
+    sync_token TEXT, -- for incremental sync
+    
+    -- Errors
+    last_error TEXT,
+    error_count INTEGER DEFAULT 0,
+    
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    
+    UNIQUE(user_id, google_calendar_id)
+);
+
+-- ----------------------------------------------------------------------------
+-- 5. MEETINGS (Video calls)
+-- ----------------------------------------------------------------------------
+CREATE TABLE public.meetings (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    event_id UUID REFERENCES public.calendar_events(id) ON DELETE SET NULL,
+    host_user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+    
+    -- Meeting details
+    title TEXT NOT NULL,
+    description TEXT,
+    
+    -- Daily.co integration
+    daily_room_name TEXT NOT NULL UNIQUE,
+    daily_room_url TEXT NOT NULL,
+    daily_room_config JSONB, -- store Daily.co room settings
+    
+    -- Scheduling
+    scheduled_start TIMESTAMPTZ NOT NULL,
+    scheduled_end TIMESTAMPTZ NOT NULL,
+    actual_start_time TIMESTAMPTZ,
+    actual_end_time TIMESTAMPTZ,
+    
+    -- Status
+    status meeting_status DEFAULT 'scheduled',
+    
+    -- Settings
+    recording_enabled BOOLEAN DEFAULT false,
+    max_participants INTEGER DEFAULT 10,
+    require_authentication BOOLEAN DEFAULT false,
+    
+    -- Guest access
+    guest_token TEXT UNIQUE, -- for shareable link
+    guest_token_expires_at TIMESTAMPTZ,
+    
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    
+    CONSTRAINT valid_meeting_time CHECK (scheduled_end > scheduled_start)
+);
+
+-- Generate guest token on meeting creation
+CREATE OR REPLACE FUNCTION public.generate_meeting_guest_token()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF NEW.guest_token IS NULL THEN
+        NEW.guest_token := encode(gen_random_bytes(32), 'base64');
+        NEW.guest_token_expires_at := NEW.scheduled_end + INTERVAL '7 days';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE TRIGGER on_meeting_created
+    BEFORE INSERT ON public.meetings
+    FOR EACH ROW EXECUTE FUNCTION public.generate_meeting_guest_token();
+
+-- ----------------------------------------------------------------------------
+-- 6. MEETING PARTICIPANTS
+-- ----------------------------------------------------------------------------
+CREATE TABLE public.meeting_participants (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    meeting_id UUID NOT NULL REFERENCES public.meetings(id) ON DELETE CASCADE,
+    user_id UUID REFERENCES public.profiles(id) ON DELETE SET NULL,
+    
+    -- Guest info (if user_id is null)
+    guest_name TEXT,
+    guest_email TEXT,
+    
+    -- Session info
+    joined_at TIMESTAMPTZ,
+    left_at TIMESTAMPTZ,
+    duration_minutes INTEGER GENERATED ALWAYS AS (
+        EXTRACT(EPOCH FROM (left_at - joined_at)) / 60
+    ) STORED,
+    
+    participant_type participant_type NOT NULL,
+    
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    
+    CONSTRAINT participant_identity CHECK (
+        user_id IS NOT NULL OR guest_name IS NOT NULL
+    )
+);
+
+-- ----------------------------------------------------------------------------
+-- 7. MEETING RECORDINGS
+-- ----------------------------------------------------------------------------
+CREATE TABLE public.meeting_recordings (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    meeting_id UUID NOT NULL REFERENCES public.meetings(id) ON DELETE CASCADE,
+    
+    -- Storage
+    storage_path TEXT NOT NULL, -- Supabase Storage path
+    storage_bucket TEXT DEFAULT 'meeting-recordings',
+    file_size_mb NUMERIC(10,2),
+    duration_seconds INTEGER,
+    format TEXT DEFAULT 'mp4',
+    
+    -- Processing
+    processing_status processing_status DEFAULT 'pending',
+    
+    -- Daily.co reference
+    daily_recording_id TEXT,
+    
+    -- Metadata
+    thumbnail_url TEXT,
+    
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    processed_at TIMESTAMPTZ,
+    
+    CONSTRAINT valid_file_size CHECK (file_size_mb > 0)
+);
+
+-- ----------------------------------------------------------------------------
+-- 8. TRANSCRIPTIONS
+-- ----------------------------------------------------------------------------
+CREATE TABLE public.transcriptions (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    recording_id UUID NOT NULL REFERENCES public.meeting_recordings(id) ON DELETE CASCADE,
+    
+    -- Transcript content
+    transcript_text TEXT NOT NULL,
+    transcript_json JSONB, -- Whisper format with timestamps
+    
+    -- Analysis
+    language TEXT,
+    word_count INTEGER,
+    confidence_score NUMERIC(3,2), -- 0.00 to 1.00
+    
+    -- Processing info
+    whisper_model_used TEXT DEFAULT 'whisper-1',
+    processing_time_seconds INTEGER,
+    
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+);
+
+-- ----------------------------------------------------------------------------
+-- 9. MEETING SUMMARIES (AI-generated)
+-- ----------------------------------------------------------------------------
+CREATE TABLE public.meeting_summaries (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    meeting_id UUID NOT NULL REFERENCES public.meetings(id) ON DELETE CASCADE,
+    transcription_id UUID REFERENCES public.transcriptions(id) ON DELETE SET NULL,
+    
+    -- Summary content
+    summary_text TEXT NOT NULL,
+    key_points JSONB, -- array of strings
+    action_items JSONB, -- array of {task, assignee, due_date}
+    topics_discussed TEXT[],
+    
+    -- Optional AI analysis
+    sentiment_analysis JSONB, -- {overall: "positive", scores: {...}}
+    participants_mentioned TEXT[],
+    
+    -- AI metadata
+    gpt_model_used TEXT DEFAULT 'gpt-4o-mini',
+    tokens_used INTEGER,
+    processing_cost_usd NUMERIC(10,4),
+    
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+);
+
+-- ----------------------------------------------------------------------------
+-- 10. JOURNAL ENTRIES (MVP Feature)
+-- ----------------------------------------------------------------------------
+CREATE TABLE public.journal_entries (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+    
+    -- Entry details
+    date DATE NOT NULL,
+    mood mood_level,
+    mood_score INTEGER CHECK (mood_score BETWEEN 1 AND 5),
+    
+    -- Content
+    entry_text TEXT,
+    tags TEXT[],
+    
+    -- Privacy
+    is_private BOOLEAN DEFAULT true,
+    
+    -- AI features
+    ai_analysis JSONB, -- sentiment, themes, suggestions
+    
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    
+    -- One entry per day per user
+    UNIQUE(user_id, date)
+);
+
+-- ----------------------------------------------------------------------------
+-- 11. AI EXTRACTED TASKS
+-- ----------------------------------------------------------------------------
+CREATE TABLE public.ai_tasks_extracted (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+    
+    -- Source (meeting OR journal)
+    meeting_id UUID REFERENCES public.meetings(id) ON DELETE CASCADE,
+    journal_entry_id UUID REFERENCES public.journal_entries(id) ON DELETE CASCADE,
+    
+    -- Task details
+    task_description TEXT NOT NULL,
+    due_date DATE,
+    priority task_priority DEFAULT 'medium',
+    status task_status DEFAULT 'pending',
+    
+    -- User override
+    user_edited BOOLEAN DEFAULT false,
+    user_notes TEXT,
+    
+    completed_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    updated_at TIMESTAMPTZ DEFAULT NOW() NOT NULL,
+    
+    CONSTRAINT task_source CHECK (
+        meeting_id IS NOT NULL OR journal_entry_id IS NOT NULL
+    )
+);
+
+-- ----------------------------------------------------------------------------
+-- 12. JOURNAL PROMPTS (Optional: daily prompts for users)
+-- ----------------------------------------------------------------------------
+CREATE TABLE public.journal_prompts (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    
+    prompt_text TEXT NOT NULL,
+    category TEXT, -- reflection, gratitude, goals, creativity
+    tags TEXT[],
+    
+    is_active BOOLEAN DEFAULT true,
+    use_count INTEGER DEFAULT 0,
+    
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+);
+
+-- Seed some default prompts
+INSERT INTO public.journal_prompts (prompt_text, category, tags) VALUES
+    ('Cosa ti ha reso grato oggi?', 'gratitude', ARRAY['daily', 'positivity']),
+    ('Qual è stata la sfida più grande di oggi e come l''hai affrontata?', 'reflection', ARRAY['growth', 'challenges']),
+    ('Cosa vuoi realizzare domani?', 'goals', ARRAY['planning', 'productivity']),
+    ('Descrivi un momento in cui ti sei sentito nel tuo elemento oggi.', 'reflection', ARRAY['self-awareness']),
+    ('Se potessi dare un consiglio al te stesso di domani, quale sarebbe?', 'reflection', ARRAY['wisdom']);
+
+-- ----------------------------------------------------------------------------
+-- 13. NOTIFICATIONS (Optional for MVP, but good to have structure)
+-- ----------------------------------------------------------------------------
+CREATE TABLE public.notifications (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES public.profiles(id) ON DELETE CASCADE,
+    
+    -- Notification content
+    type TEXT NOT NULL, -- meeting_reminder, recording_ready, task_due, journal_prompt
+    title TEXT NOT NULL,
+    message TEXT,
+    
+    -- Related entity (polymorphic reference)
+    related_id UUID,
+    related_type TEXT, -- meeting, event, task, recording
+    
+    -- Action URL
+    action_url TEXT,
+    
+    -- Status
+    read_at TIMESTAMPTZ,
+    sent_at TIMESTAMPTZ,
+    
+    created_at TIMESTAMPTZ DEFAULT NOW() NOT NULL
+);
+
+-- ============================================================================
+-- INDEXES (Performance optimization)
+-- ============================================================================
+
+-- Profiles
+CREATE INDEX idx_profiles_email ON public.profiles(email);
+
+-- Calendar Events
+CREATE INDEX idx_calendar_events_user_id ON public.calendar_events(user_id);
+CREATE INDEX idx_calendar_events_start_time ON public.calendar_events(start_time);
+CREATE INDEX idx_calendar_events_user_time ON public.calendar_events(user_id, start_time);
+CREATE INDEX idx_calendar_events_google_id ON public.calendar_events(google_event_id) WHERE google_event_id IS NOT NULL;
+CREATE INDEX idx_calendar_events_recurrence ON public.calendar_events(parent_event_id) WHERE parent_event_id IS NOT NULL;
+
+-- Google Calendar Sync
+CREATE INDEX idx_google_sync_user ON public.google_calendar_sync(user_id);
+
+-- Meetings
+CREATE INDEX idx_meetings_host ON public.meetings(host_user_id);
+CREATE INDEX idx_meetings_status ON public.meetings(status);
+CREATE INDEX idx_meetings_scheduled_start ON public.meetings(scheduled_start);
+CREATE INDEX idx_meetings_guest_token ON public.meetings(guest_token) WHERE guest_token IS NOT NULL;
+
+-- Meeting Participants
+CREATE INDEX idx_participants_meeting ON public.meeting_participants(meeting_id);
+CREATE INDEX idx_participants_user ON public.meeting_participants(user_id) WHERE user_id IS NOT NULL;
+
+-- Recordings & Transcriptions
+CREATE INDEX idx_recordings_meeting ON public.meeting_recordings(meeting_id);
+CREATE INDEX idx_transcriptions_recording ON public.transcriptions(recording_id);
+
+-- Summaries
+CREATE INDEX idx_summaries_meeting ON public.meeting_summaries(meeting_id);
+
+-- Tasks
+CREATE INDEX idx_tasks_user ON public.ai_tasks_extracted(user_id);
+CREATE INDEX idx_tasks_status ON public.ai_tasks_extracted(status);
+CREATE INDEX idx_tasks_due_date ON public.ai_tasks_extracted(due_date) WHERE due_date IS NOT NULL;
+
+-- Journal
+CREATE INDEX idx_journal_user_date ON public.journal_entries(user_id, date DESC);
+CREATE INDEX idx_journal_mood ON public.journal_entries(mood) WHERE mood IS NOT NULL;
+
+-- Notifications
+CREATE INDEX idx_notifications_user ON public.notifications(user_id);
+CREATE INDEX idx_notifications_unread ON public.notifications(user_id, read_at) WHERE read_at IS NULL;
+
+-- ============================================================================
+-- ROW LEVEL SECURITY (RLS) POLICIES
+-- ============================================================================
+
+-- Enable RLS on all tables
+ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.user_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.calendar_events ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.google_calendar_sync ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.meetings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.meeting_participants ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.meeting_recordings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.transcriptions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.meeting_summaries ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.ai_tasks_extracted ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.journal_entries ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.journal_prompts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.notifications ENABLE ROW LEVEL SECURITY;
+
+-- ----------------------------------------------------------------------------
+-- PROFILES: Users can only see/edit their own profile
+-- ----------------------------------------------------------------------------
+CREATE POLICY "Users can view own profile"
+    ON public.profiles FOR SELECT
+    USING (auth.uid() = id);
+
+CREATE POLICY "Users can update own profile"
+    ON public.profiles FOR UPDATE
+    USING (auth.uid() = id);
+
+-- ----------------------------------------------------------------------------
+-- USER SETTINGS: Users can only access their own settings
+-- ----------------------------------------------------------------------------
+CREATE POLICY "Users can view own settings"
+    ON public.user_settings FOR SELECT
+    USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can update own settings"
+    ON public.user_settings FOR UPDATE
+    USING (auth.uid() = user_id);
+
+-- ----------------------------------------------------------------------------
+-- CALENDAR EVENTS: Users can only access their own events
+-- ----------------------------------------------------------------------------
+CREATE POLICY "Users can view own events"
+    ON public.calendar_events FOR SELECT
+    USING (auth.uid() = user_id AND is_deleted = false);
+
+CREATE POLICY "Users can create own events"
+    ON public.calendar_events FOR INSERT
+    WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY "Users can update own events"
+    ON public.calendar_events FOR UPDATE
+    USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can delete own events"
+    ON public.calendar_events FOR DELETE
+    USING (auth.uid() = user_id);
+
+-- ----------------------------------------------------------------------------
+-- GOOGLE CALENDAR SYNC: Users can only access their own sync
+-- ----------------------------------------------------------------------------
+CREATE POLICY "Users can view own google sync"
+    ON public.google_calendar_sync FOR SELECT
+    USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can manage own google sync"
+    ON public.google_calendar_sync FOR ALL
+    USING (auth.uid() = user_id);
+
+-- ----------------------------------------------------------------------------
+-- MEETINGS: Host can manage, guests can view with token
+-- ----------------------------------------------------------------------------
+CREATE POLICY "Hosts can manage own meetings"
+    ON public.meetings FOR ALL
+    USING (auth.uid() = host_user_id);
+
+CREATE POLICY "Participants can view meetings they're in"
+    ON public.meetings FOR SELECT
+    USING (
+        EXISTS (
+            SELECT 1 FROM public.meeting_participants
+            WHERE meeting_participants.meeting_id = meetings.id
+            AND meeting_participants.user_id = auth.uid()
+        )
+    );
+
+-- Note: Guest access via token is handled in application layer
+-- Guest tokens bypass RLS through service role
+
+-- ----------------------------------------------------------------------------
+-- MEETING PARTICIPANTS: Hosts and participants can view
+-- ----------------------------------------------------------------------------
+CREATE POLICY "Meeting hosts can manage participants"
+    ON public.meeting_participants FOR ALL
+    USING (
+        EXISTS (
+            SELECT 1 FROM public.meetings
+            WHERE meetings.id = meeting_participants.meeting_id
+            AND meetings.host_user_id = auth.uid()
+        )
+    );
+
+CREATE POLICY "Participants can view own participation"
+    ON public.meeting_participants FOR SELECT
+    USING (auth.uid() = user_id);
+
+-- ----------------------------------------------------------------------------
+-- RECORDINGS: Host and participants can view
+-- ----------------------------------------------------------------------------
+CREATE POLICY "Meeting hosts can manage recordings"
+    ON public.meeting_recordings FOR ALL
+    USING (
+        EXISTS (
+            SELECT 1 FROM public.meetings
+            WHERE meetings.id = meeting_recordings.meeting_id
+            AND meetings.host_user_id = auth.uid()
+        )
+    );
+
+CREATE POLICY "Participants can view recordings"
+    ON public.meeting_recordings FOR SELECT
+    USING (
+        EXISTS (
+            SELECT 1 FROM public.meeting_participants
+            WHERE meeting_participants.meeting_id = meeting_recordings.meeting_id
+            AND meeting_participants.user_id = auth.uid()
+        )
+    );
+
+-- ----------------------------------------------------------------------------
+-- TRANSCRIPTIONS: Same as recordings
+-- ----------------------------------------------------------------------------
+CREATE POLICY "Hosts can manage transcriptions"
+    ON public.transcriptions FOR ALL
+    USING (
+        EXISTS (
+            SELECT 1 FROM public.meeting_recordings
+            JOIN public.meetings ON meetings.id = meeting_recordings.meeting_id
+            WHERE meeting_recordings.id = transcriptions.recording_id
+            AND meetings.host_user_id = auth.uid()
+        )
+    );
+
+CREATE POLICY "Participants can view transcriptions"
+    ON public.transcriptions FOR SELECT
+    USING (
+        EXISTS (
+            SELECT 1 FROM public.meeting_recordings
+            JOIN public.meeting_participants ON meeting_participants.meeting_id = meeting_recordings.meeting_id
+            WHERE meeting_recordings.id = transcriptions.recording_id
+            AND meeting_participants.user_id = auth.uid()
+        )
+    );
+
+-- ----------------------------------------------------------------------------
+-- SUMMARIES: Same as recordings
+-- ----------------------------------------------------------------------------
+CREATE POLICY "Hosts can manage summaries"
+    ON public.meeting_summaries FOR ALL
+    USING (
+        EXISTS (
+            SELECT 1 FROM public.meetings
+            WHERE meetings.id = meeting_summaries.meeting_id
+            AND meetings.host_user_id = auth.uid()
+        )
+    );
+
+CREATE POLICY "Participants can view summaries"
+    ON public.meeting_summaries FOR SELECT
+    USING (
+        EXISTS (
+            SELECT 1 FROM public.meeting_participants
+            WHERE meeting_participants.meeting_id = meeting_summaries.meeting_id
+            AND meeting_participants.user_id = auth.uid()
+        )
+    );
+
+-- ----------------------------------------------------------------------------
+-- AI TASKS: Users can only access their own tasks
+-- ----------------------------------------------------------------------------
+CREATE POLICY "Users can view own tasks"
+    ON public.ai_tasks_extracted FOR SELECT
+    USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can manage own tasks"
+    ON public.ai_tasks_extracted FOR ALL
+    USING (auth.uid() = user_id);
+
+-- ----------------------------------------------------------------------------
+-- JOURNAL: Highly private - only owner can access
+-- ----------------------------------------------------------------------------
+CREATE POLICY "Users can view own journal"
+    ON public.journal_entries FOR SELECT
+    USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can create own journal"
+    ON public.journal_entries FOR INSERT
+    WITH CHECK (auth.uid() = user_id);
+
+CREATE POLICY "Users can update own journal"
+    ON public.journal_entries FOR UPDATE
+    USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can delete own journal"
+    ON public.journal_entries FOR DELETE
+    USING (auth.uid() = user_id);
+
+-- ----------------------------------------------------------------------------
+-- JOURNAL PROMPTS: Public read-only (all users can see prompts)
+-- ----------------------------------------------------------------------------
+CREATE POLICY "Anyone can view active prompts"
+    ON public.journal_prompts FOR SELECT
+    USING (is_active = true);
+
+-- ----------------------------------------------------------------------------
+-- NOTIFICATIONS: Users can only access their own
+-- ----------------------------------------------------------------------------
+CREATE POLICY "Users can view own notifications"
+    ON public.notifications FOR SELECT
+    USING (auth.uid() = user_id);
+
+CREATE POLICY "Users can update own notifications"
+    ON public.notifications FOR UPDATE
+    USING (auth.uid() = user_id);
+
+-- ============================================================================
+-- FUNCTIONS: Utility functions
+-- ============================================================================
+
+-- Function: Get user's upcoming meetings
+CREATE OR REPLACE FUNCTION get_upcoming_meetings(days_ahead INTEGER DEFAULT 7)
+RETURNS TABLE (
+    meeting_id UUID,
+    title TEXT,
+    scheduled_start TIMESTAMPTZ,
+    scheduled_end TIMESTAMPTZ,
+    status meeting_status,
+    daily_room_url TEXT,
+    is_host BOOLEAN
+) 
+SECURITY DEFINER
+AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        m.id,
+        m.title,
+        m.scheduled_start,
+        m.scheduled_end,
+        m.status,
+        m.daily_room_url,
+        (m.host_user_id = auth.uid()) as is_host
+    FROM public.meetings m
+    WHERE 
+        (m.host_user_id = auth.uid() OR 
+         EXISTS (
+            SELECT 1 FROM public.meeting_participants mp 
+            WHERE mp.meeting_id = m.id AND mp.user_id = auth.uid()
+         ))
+        AND m.scheduled_start >= NOW()
+        AND m.scheduled_start <= NOW() + (days_ahead || ' days')::INTERVAL
+        AND m.status != 'cancelled'
+    ORDER BY m.scheduled_start ASC;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function: Get user's journal streak
+CREATE OR REPLACE FUNCTION get_journal_streak(p_user_id UUID)
+RETURNS INTEGER
+SECURITY DEFINER
+AS $$
+DECLARE
+    current_streak INTEGER := 0;
+    check_date DATE := CURRENT_DATE;
+    has_entry BOOLEAN;
+BEGIN
+    LOOP
+        SELECT EXISTS (
+            SELECT 1 FROM public.journal_entries
+            WHERE user_id = p_user_id AND date = check_date
+        ) INTO has_entry;
+        
+        EXIT WHEN NOT has_entry;
+        
+        current_streak := current_streak + 1;
+        check_date := check_date - INTERVAL '1 day';
+    END LOOP;
+    
+    RETURN current_streak;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Function: Update updated_at timestamp
+CREATE OR REPLACE FUNCTION update_updated_at_column()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Apply updated_at trigger to relevant tables
+CREATE TRIGGER update_profiles_updated_at
+    BEFORE UPDATE ON public.profiles
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_user_settings_updated_at
+    BEFORE UPDATE ON public.user_settings
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_calendar_events_updated_at
+    BEFORE UPDATE ON public.calendar_events
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_meetings_updated_at
+    BEFORE UPDATE ON public.meetings
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+CREATE TRIGGER update_journal_entries_updated_at
+    BEFORE UPDATE ON public.journal_entries
+    FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
+
+-- ============================================================================
+-- STORAGE BUCKETS (For Supabase Storage)
+-- ============================================================================
+
+-- Note: Run these in Supabase Dashboard > Storage, or via API
+-- These are declarative commands for documentation
+
+/*
+-- Create bucket for meeting recordings
+INSERT INTO storage.buckets (id, name, public) 
+VALUES ('meeting-recordings', 'meeting-recordings', false);
+
+-- Create bucket for profile avatars
+INSERT INTO storage.buckets (id, name, public) 
+VALUES ('avatars', 'avatars', true);
+
+-- RLS for meeting-recordings bucket
+CREATE POLICY "Users can view recordings they have access to"
+ON storage.objects FOR SELECT
+USING (
+    bucket_id = 'meeting-recordings' AND
+    EXISTS (
+        SELECT 1 FROM public.meeting_recordings mr
+        JOIN public.meetings m ON m.id = mr.meeting_id
+        WHERE mr.storage_path = name
+        AND (
+            m.host_user_id = auth.uid() OR
+            EXISTS (
+                SELECT 1 FROM public.meeting_participants mp
+                WHERE mp.meeting_id = m.id AND mp.user_id = auth.uid()
+            )
+        )
+    )
+);
+
+CREATE POLICY "Hosts can upload recordings"
+ON storage.objects FOR INSERT
+WITH CHECK (
+    bucket_id = 'meeting-recordings' AND
+    auth.role() = 'authenticated'
+);
+
+-- RLS for avatars bucket (public read, owner write)
+CREATE POLICY "Avatar images are publicly accessible"
+ON storage.objects FOR SELECT
+USING (bucket_id = 'avatars');
+
+CREATE POLICY "Users can upload their own avatar"
+ON storage.objects FOR INSERT
+WITH CHECK (
+    bucket_id = 'avatars' AND
+    auth.uid()::text = (storage.foldername(name))[1]
+);
+*/
+
+-- ============================================================================
+-- VIEWS (Optional: Useful for common queries)
+-- ============================================================================
+
+-- View: User's calendar with all events and meetings
+CREATE OR REPLACE VIEW user_calendar_view AS
+SELECT 
+    ce.id,
+    ce.user_id,
+    ce.title,
+    ce.description,
+    ce.start_time,
+    ce.end_time,
+    ce.all_day,
+    ce.event_type,
+    ce.color_tag,
+    ce.location,
+    m.id as meeting_id,
+    m.daily_room_url,
+    m.status as meeting_status
+FROM public.calendar_events ce
+LEFT JOIN public.meetings m ON m.event_id = ce.id
+WHERE ce.is_deleted = false;
+
+-- View: Meeting details with participants count
+CREATE OR REPLACE VIEW meeting_details_view AS
+SELECT 
+    m.id,
+    m.title,
+    m.host_user_id,
+    p.full_name as host_name,
+    m.scheduled_start,
+    m.scheduled_end,
+    m.status,
+    m.daily_room_url,
+    m.guest_token,
+    COUNT(DISTINCT mp.id) as participant_count,
+    COALESCE(
+        JSONB_AGG(
+            JSONB_BUILD_OBJECT(
+                'user_id', mp.user_id,
+                'name', COALESCE(mp.guest_name, p2.full_name),
+                'type', mp.participant_type
+            )
+        ) FILTER (WHERE mp.id IS NOT NULL),
+        '[]'::jsonb
+    ) as participants
+FROM public.meetings m
+LEFT JOIN public.profiles p ON p.id = m.host_user_id
+LEFT JOIN public.meeting_participants mp ON mp.meeting_id = m.id
+LEFT JOIN public.profiles p2 ON p2.id = mp.user_id
+GROUP BY m.id, p.full_name;
+
+-- ============================================================================
+-- SEED DATA (Optional: For development/testing)
+-- ============================================================================
+
+-- Note: Uncomment these for development database seeding
+-- Do NOT run in production
+
+/*
+-- Seed a test user (requires auth.users entry first)
+INSERT INTO public.profiles (id, email, full_name, timezone) VALUES
+    ('00000000-0000-0000-0000-000000000001', 'test@desk-mate.it', 'Test User', 'Europe/Rome');
+
+-- Seed some calendar events
+INSERT INTO public.calendar_events (user_id, title, start_time, end_time, event_type) VALUES
+    ('00000000-0000-0000-0000-000000000001', 'Team Meeting', NOW() + INTERVAL '1 day', NOW() + INTERVAL '1 day' + INTERVAL '1 hour', 'meeting'),
+    ('00000000-0000-0000-0000-000000000001', 'Lunch Break', NOW() + INTERVAL '1 day' + INTERVAL '4 hours', NOW() + INTERVAL '1 day' + INTERVAL '5 hours', 'personal');
+*/
+
+-- ============================================================================
+-- SETUP COMPLETE ✅
+-- ============================================================================
+
+-- Next steps:
+-- 1. Run this script in Supabase SQL Editor
+-- 2. Create Storage buckets in Dashboard > Storage
+-- 3. Configure Google OAuth in Supabase Dashboard > Authentication > Providers
+-- 4. Generate TypeScript types: supabase gen types typescript --local > types/supabase.ts
+-- 5. Test authentication flow
+-- 6. Begin vibe coding with schema reference
+
+-- ============================================================================

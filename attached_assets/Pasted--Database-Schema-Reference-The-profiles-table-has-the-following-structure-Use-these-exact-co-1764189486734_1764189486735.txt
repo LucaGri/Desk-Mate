@@ -1,0 +1,251 @@
+## Database Schema Reference
+
+The `profiles` table has the following structure. **Use these exact column names and types**:
+
+### Table: public.profiles
+```typescript
+interface Profile {
+  // Primary key (from auth.users)
+  id: string; // UUID
+  
+  // Personal Info
+  email: string; // NOT NULL, read-only from auth
+  first_name: string | null;
+  last_name: string | null;
+  full_name: string | null; // DEPRECATED - use first_name + last_name
+  avatar_url: string | null;
+  job_title: string | null;
+  
+  // Calendar Preferences
+  timezone: string; // DEFAULT 'Europe/Rome', IANA format
+  time_format: '12h' | '24h'; // ENUM, DEFAULT '24h'
+  week_start_day: 'monday' | 'sunday'; // ENUM, DEFAULT 'monday'
+  default_calendar_view: 'day' | 'week' | 'month'; // ENUM, DEFAULT 'week'
+  default_meeting_duration: '15' | '30' | '45' | '60'; // ENUM (string!), DEFAULT '30'
+  
+  // Notification Preferences
+  email_notifications_enabled: boolean; // DEFAULT true
+  default_reminder_timing: '5' | '10' | '15' | '30'; // ENUM (string!), DEFAULT '15'
+  
+  // Video Call Preferences (Daily.co)
+  video_camera_on_join: boolean; // DEFAULT true
+  video_mic_on_join: boolean; // DEFAULT true
+  video_background_blur: boolean; // DEFAULT false
+  
+  // Working Hours
+  work_hours_start: string; // TIME format 'HH:MM', DEFAULT '09:00'
+  work_hours_end: string; // TIME format 'HH:MM', DEFAULT '18:00'
+  work_days: number[]; // Array of integers: 0=Sun, 1=Mon, ..., 6=Sat, DEFAULT [1,2,3,4,5]
+  
+  // UI Preferences
+  theme: 'light' | 'dark' | 'system'; // ENUM, DEFAULT 'system'
+  locale: string; // DEFAULT 'it' (already exists, use this NOT 'language')
+  
+  // Metadata (auto-managed)
+  onboarding_completed: boolean; // DEFAULT false
+  created_at: string; // TIMESTAMPTZ
+  updated_at: string; // TIMESTAMPTZ
+}
+```
+
+### CRITICAL TYPE NOTES:
+1. `default_meeting_duration` and `default_reminder_timing` are **STRING enums**, not numbers!
+2. `work_days` is an **integer array** `number[]`, not a string
+3. `work_hours_start` and `work_hours_end` are **TIME strings** in 'HH:MM' format
+4. Use `locale` (existing column), NOT `language`
+5. Use `first_name` + `last_name`, NOT `full_name` (deprecated)
+
+### Avatar Storage:
+- Bucket: `avatars` (public)
+- Path pattern: `{user_id}/avatar.{ext}`
+- Allowed types: jpeg, png, webp, gif
+- Max size: 5MB
+- Public URL: `https://[PROJECT_ID].supabase.co/storage/v1/object/public/avatars/{user_id}/avatar.{ext}`
+
+### Helper Functions Available:
+- `get_user_display_name(user_id)` - Returns full name or email
+- `get_user_initials(user_id)` - Returns 1-2 letter initials
+
+---
+
+## Feature Requirements
+
+### Create a Profile Page with these sections:
+
+### 1. Personal Information Section
+- **First Name**: Text input
+- **Last Name**: Text input  
+- **Email**: Read-only display (from auth, cannot be changed here)
+- **Job Title**: Text input, optional
+- **Avatar Upload**: 
+  - Show current avatar or generated initials as fallback
+  - Upload button to change photo
+  - Use Supabase Storage bucket 'avatars'
+  - Generate initials from first_name + last_name (or email if empty)
+  - Display initials in a colored circle as default avatar
+
+### 2. Calendar Preferences Section
+- **Timezone**: Searchable dropdown with common IANA timezones
+  - Include: Europe/Rome, Europe/London, America/New_York, America/Los_Angeles, Asia/Tokyo, etc.
+- **Time Format**: Radio or toggle - "12h" | "24h"
+- **Week Starts On**: Radio or toggle - "Monday" | "Sunday"
+- **Default Calendar View**: Select - "Day" | "Week" | "Month"
+- **Default Meeting Duration**: Select - "15 min" | "30 min" | "45 min" | "60 min"
+  - IMPORTANT: Store as string '15', '30', '45', '60' - NOT as number!
+
+### 3. Notification Preferences Section
+- **Email Notifications**: Toggle on/off
+- **Default Reminder**: Select - "5 min" | "10 min" | "15 min" | "30 min before"
+  - IMPORTANT: Store as string '5', '10', '15', '30' - NOT as number!
+
+### 4. Video Call Preferences Section
+- **Camera on by default**: Toggle - start calls with camera on/off
+- **Microphone on by default**: Toggle - start calls with mic on/off
+- **Background blur**: Toggle - enable blur by default
+
+### 5. Working Hours Section
+- **Work Hours Start**: Time picker (HH:MM format)
+- **Work Hours End**: Time picker (HH:MM format)
+- **Working Days**: Checkbox group for each day
+  - Display: Mon, Tue, Wed, Thu, Fri, Sat, Sun
+  - Store as integer array: [1,2,3,4,5] for Mon-Fri
+  - 0=Sunday, 1=Monday, ..., 6=Saturday
+
+### 6. Theme & Language Section
+- **Theme**: Radio or segment control - "Light" | "Dark" | "System"
+  - Implement actual theme switching (update CSS/Tailwind dark mode)
+- **Language**: Select - "Italiano" | "English"
+  - Use column `locale`, store 'it' or 'en'
+
+---
+
+## Technical Implementation
+
+### Data Fetching
+```typescript
+// Fetch profile on mount
+const { data: profile, error } = await supabase
+  .from('profiles')
+  .select('*')
+  .eq('id', user.id)
+  .single();
+```
+
+### Data Saving
+```typescript
+// Update profile
+const { error } = await supabase
+  .from('profiles')
+  .update({
+    first_name: formData.firstName,
+    last_name: formData.lastName,
+    job_title: formData.jobTitle,
+    timezone: formData.timezone,
+    time_format: formData.timeFormat, // '12h' or '24h'
+    week_start_day: formData.weekStartDay, // 'monday' or 'sunday'
+    default_calendar_view: formData.defaultView, // 'day', 'week', 'month'
+    default_meeting_duration: formData.meetingDuration, // '15', '30', '45', '60' as STRING
+    email_notifications_enabled: formData.emailNotifications,
+    default_reminder_timing: formData.reminderTiming, // '5', '10', '15', '30' as STRING
+    video_camera_on_join: formData.cameraOn,
+    video_mic_on_join: formData.micOn,
+    video_background_blur: formData.backgroundBlur,
+    work_hours_start: formData.workStart, // 'HH:MM'
+    work_hours_end: formData.workEnd, // 'HH:MM'
+    work_days: formData.workDays, // [1, 2, 3, 4, 5]
+    theme: formData.theme, // 'light', 'dark', 'system'
+    locale: formData.locale, // 'it', 'en'
+  })
+  .eq('id', user.id);
+```
+
+### Avatar Upload
+```typescript
+// Upload avatar to Supabase Storage
+const fileExt = file.name.split('.').pop();
+const filePath = `${user.id}/avatar.${fileExt}`;
+
+const { error: uploadError } = await supabase.storage
+  .from('avatars')
+  .upload(filePath, file, { upsert: true });
+
+// Get public URL
+const { data: { publicUrl } } = supabase.storage
+  .from('avatars')
+  .getPublicUrl(filePath);
+
+// Update profile with new avatar URL
+await supabase
+  .from('profiles')
+  .update({ avatar_url: publicUrl })
+  .eq('id', user.id);
+```
+
+### Initials Generation (Client-side fallback)
+```typescript
+function getInitials(firstName?: string, lastName?: string, email?: string): string {
+  if (firstName) {
+    return (firstName[0] + (lastName?.[0] || '')).toUpperCase();
+  }
+  return email?.substring(0, 2).toUpperCase() || '??';
+}
+```
+
+---
+
+## UI/UX Requirements
+
+1. **Layout**: Single page with clearly separated sections using cards or dividers
+2. **Form State**: Use React Hook Form or similar for form management
+3. **Validation**: 
+   - Required: first_name (warn if empty but allow save)
+   - Work hours: end must be after start
+4. **Save Behavior**: 
+   - Single "Save Changes" button at bottom
+   - Or auto-save with debounce (indicate saving state)
+   - Show success/error toast notifications
+5. **Loading States**: Skeleton loaders while fetching profile
+6. **Theme Switching**: Apply theme change immediately on selection
+7. **Responsive**: Mobile-friendly layout, stack sections vertically on small screens
+8. **Accessibility**: Proper labels, ARIA attributes, keyboard navigation
+
+---
+
+## File Structure Suggestion
+```
+src/
+├── pages/
+│   └── ProfilePage.tsx
+├── components/
+│   └── profile/
+│       ├── PersonalInfoSection.tsx
+│       ├── CalendarPreferencesSection.tsx
+│       ├── NotificationPreferencesSection.tsx
+│       ├── VideoPreferencesSection.tsx
+│       ├── WorkingHoursSection.tsx
+│       ├── ThemeLanguageSection.tsx
+│       └── AvatarUpload.tsx
+├── hooks/
+│   └── useProfile.ts (fetch/update logic)
+├── types/
+│   └── profile.ts (TypeScript interfaces)
+└── lib/
+    └── timezones.ts (timezone list)
+```
+
+---
+
+## Common Pitfalls to AVOID
+
+❌ DO NOT store `default_meeting_duration` as number - it's a STRING enum
+❌ DO NOT store `default_reminder_timing` as number - it's a STRING enum  
+❌ DO NOT use `language` column - use `locale`
+❌ DO NOT use `full_name` - use `first_name` + `last_name`
+❌ DO NOT forget to handle null values on first load (new users)
+❌ DO NOT upload avatar without `upsert: true` (will fail on re-upload)
+
+✅ DO use exact column names from schema
+✅ DO handle loading and error states
+✅ DO validate time format for work hours
+✅ DO apply theme changes immediately to UI
+✅ DO show initials when avatar_url is null

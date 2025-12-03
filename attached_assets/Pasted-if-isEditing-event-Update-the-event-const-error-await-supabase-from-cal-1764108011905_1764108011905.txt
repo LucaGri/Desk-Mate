@@ -1,0 +1,95 @@
+if (isEditing && event) {
+  // Update the event
+  const { error } = await supabase
+    .from("calendar_events")
+    .update({
+      ...eventData,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("id", event.id);
+
+  if (error) throw error;
+
+  // Handle video call changes in editing mode
+  const hadVideoCall = !!meeting;
+  const wantsVideoCall = values.has_video_call;
+
+  if (wantsVideoCall && !hadVideoCall) {
+    // CREATE meeting for existing event
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (!session?.access_token) {
+        throw new Error("Not authenticated");
+      }
+
+      const response = await fetch("/api/meetings", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({
+          event_id: event.id,
+          title: values.title,
+          description: values.description,
+          scheduled_start: startDateTime,
+          scheduled_end: endDateTime,
+          recording_enabled: values.recording_enabled,
+          transcription_enabled: values.transcription_enabled,
+        }),
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.error || "Failed to create meeting");
+      }
+
+      const meetingResponse = await response.json();
+      if (meetingResponse.success && meetingResponse.meeting) {
+        setMeeting(meetingResponse.meeting); // Update local state
+        toast({
+          title: "Video call added",
+          description: "Your meeting room is ready.",
+        });
+      }
+    } catch (meetingError: any) {
+      console.error("Error creating video call:", meetingError);
+      toast({
+        title: "Event updated",
+        description: "Event saved but video call setup failed.",
+        variant: "destructive",
+      });
+    }
+  } else if (!wantsVideoCall && hadVideoCall && meeting) {
+    // DELETE meeting when video call is disabled
+    try {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session?.access_token) {
+        await fetch(`/api/meetings/${meeting.daily_room_name}`, {
+          method: "DELETE",
+          headers: {
+            "Authorization": `Bearer ${session.access_token}`,
+          },
+        });
+        setMeeting(null);
+      }
+    } catch (deleteError) {
+      console.error("Error deleting meeting:", deleteError);
+    }
+    toast({
+      title: "Event updated",
+      description: "Video call removed.",
+    });
+  } else {
+    toast({
+      title: "Event updated",
+      description: "Your event has been updated successfully.",
+    });
+  }
+
+  onEventSaved();
+  // DON'T close dialog if we just created a meeting - let user see the Join button
+  if (!(wantsVideoCall && !hadVideoCall)) {
+    onOpenChange(false);
+  }
+}

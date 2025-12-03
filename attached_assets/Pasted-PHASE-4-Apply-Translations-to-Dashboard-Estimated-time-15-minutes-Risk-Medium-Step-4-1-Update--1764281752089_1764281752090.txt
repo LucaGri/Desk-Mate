@@ -1,0 +1,100 @@
+PHASE 4: Apply Translations to Dashboard
+Estimated time: 15 minutes | Risk: Medium
+Step 4.1: Update Dashboard Component
+In client/src/pages/dashboard.tsx:
+Add import at top:
+typescriptimport { useTranslation } from 'react-i18next';
+Add hook at start of component:
+typescriptexport default function Dashboard() {
+  const { t } = useTranslation();
+  // ... rest of existing code
+Replace hardcoded strings with t() calls:
+Replace each string systematically. Here are all the changes:
+tsx// Loading state
+<p className="text-sm text-muted-foreground" data-testid="text-loading">
+  {t('common.loading')}
+</p>
+
+// Error state
+<CardTitle data-testid="text-error-title">{t('errors.loadingProfile')}</CardTitle>
+<CardDescription>{t('errors.couldNotLoadProfile')}</CardDescription>
+<Button ...>{t('common.retry')}</Button>
+
+// Sign out toast
+toast({
+  title: t('dashboard.signedOut'),
+  description: t('dashboard.signedOutDescription'),
+});
+
+// Sign out button
+<Button ...>
+  <LogOut className="h-4 w-4 mr-2" />
+  {t('common.signOut')}
+</Button>
+
+// Welcome section
+<h2 className="text-3xl font-bold mb-2" data-testid="text-welcome">
+  {t('dashboard.welcomeBack', { name: firstName })}
+</h2>
+<p className="text-muted-foreground" data-testid="text-subtitle">
+  {t('dashboard.subtitle')}
+</p>
+
+// Calendar card
+<CardTitle>{t('dashboard.calendarMeetings')}</CardTitle>
+<CardDescription>{t('dashboard.calendarDescription')}</CardDescription>
+<p className="text-sm text-muted-foreground">
+  {t('dashboard.calendarDetails')}
+</p>
+<Button ...>{t('dashboard.openCalendar')}</Button>
+
+// AI Chat card
+<CardTitle>{t('dashboard.aiChat')}</CardTitle>
+<CardDescription>{t('dashboard.aiChatDescription')}</CardDescription>
+<p className="text-sm text-muted-foreground">
+  {t('dashboard.aiChatDetails')}
+</p>
+<Button ...>{t('dashboard.startChatting')}</Button>
+
+// Journal card
+<CardTitle>{t('dashboard.journal')}</CardTitle>
+<CardDescription>{t('dashboard.journalDescription')}</CardDescription>
+<p className="text-sm text-muted-foreground">
+  {t('dashboard.journalDetails')}
+</p>
+<Button ...>{t('dashboard.openJournal')}</Button>
+
+// Analytics card
+<CardTitle>{t('dashboard.analytics')}</CardTitle>
+<CardDescription>{t('dashboard.analyticsDescription')}</CardDescription>
+<p className="text-sm text-muted-foreground">
+  {t('dashboard.analyticsDetails')}
+</p>
+<Button ...>{t('dashboard.viewAnalytics')}</Button>
+
+// Settings card
+<CardTitle>{t('dashboard.yourSettings')}</CardTitle>
+<CardDescription>{t('dashboard.currentPreferences')}</CardDescription>
+<Button ...>
+  <Settings className="h-4 w-4 mr-2" />
+  {t('dashboard.editSettings')}
+</Button>
+
+// Settings labels
+<p className="text-muted-foreground">{t('dashboard.timezone')}</p>
+<p className="text-muted-foreground">{t('dashboard.language')}</p>
+<p className="text-muted-foreground">{t('dashboard.workHours')}</p>
+<p className="text-muted-foreground">{t('dashboard.theme')}</p>
+
+// Language display value (use languages object from translations)
+<p className="font-medium" data-testid="text-locale">
+  {t(`languages.${profile.locale}`)}
+</p>
+
+✅ Phase 4 Verification
+
+Change language in Profile to each of the 5 languages
+Return to Dashboard
+All text should be translated
+Check: Welcome message, cards, buttons, settings labels
+

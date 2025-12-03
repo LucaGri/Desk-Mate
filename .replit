@@ -1,0 +1,76 @@
+modules = ["nodejs-20", "web", "postgresql-16"]
+run = "npm run dev"
+hidden = [".config", ".git", "generated-icon.png", "node_modules", "dist"]
+
+[nix]
+channel = "stable-24_05"
+
+[deployment]
+deploymentTarget = "autoscale"
+build = ["npm", "run", "build"]
+run = ["npm", "run", "start"]
+
+[[ports]]
+localPort = 5000
+externalPort = 80
+
+[[ports]]
+localPort = 35489
+externalPort = 3003
+
+[[ports]]
+localPort = 36195
+externalPort = 5000
+
+[[ports]]
+localPort = 39307
+externalPort = 3001
+
+[[ports]]
+localPort = 42585
+externalPort = 4200
+
+[[ports]]
+localPort = 44705
+externalPort = 3002
+
+[[ports]]
+localPort = 45067
+externalPort = 5173
+
+[[ports]]
+localPort = 45095
+externalPort = 3000
+
+[env]
+PORT = "5000"
+
+[workflows]
+runButton = "Project"
+
+[[workflows.workflow]]
+name = "Project"
+mode = "parallel"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "workflow.run"
+args = "Start application"
+
+[[workflows.workflow]]
+name = "Start application"
+author = "agent"
+
+[[workflows.workflow.tasks]]
+task = "shell.exec"
+args = "npm run dev"
+waitForPort = 5000
+
+[agent]
+integrations = ["javascript_log_in_with_replit:1.0.0", "javascript_database:1.0.0"]
+
+[userenv]
+
+[userenv.shared]
+VITE_SUPABASE_URL = "https://thvhmbbzylvlazseqndv.supabase.co"
+VITE_SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRodmhtYmJ6eWx2bGF6c2VxbmR2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjQwMDAwMzcsImV4cCI6MjA3OTU3NjAzN30.jfvt-tR7-rnZtK-wmeGnbbMQ_OVLukCqY8Bx6Yz3_R4"

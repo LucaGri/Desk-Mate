@@ -1,0 +1,66 @@
+FIX: Email registration with verification email
+
+CURRENT ISSUE:
+After user submits registration form, getting 401 errors because the app tries to access protected resources before email is verified.
+
+CORRECT EMAIL REGISTRATION FLOW:
+
+Step 1 - User Registration:
+```typescript
+const { data, error } = await supabase.auth.signUp({
+  email,
+  password,
+  options: {
+    emailRedirectTo: `${window.location.origin}/auth/callback`
+  }
+})
+
+if (error) {
+  toast.error(error.message)
+  return
+}
+
+// Supabase AUTOMATICALLY sends verification email via Resend
+// Email will come from: noreply@desk-mate.it
+// User will receive link to verify their email
+```
+
+Step 2 - Show Success Message:
+After successful signup, DON'T redirect to onboarding.
+Instead, show clear message to user:
+```typescript
+// Show this UI after signup:
+<div className="text-center">
+  <h2>Check your email</h2>
+  <p>We've sent a verification link to {email}</p>
+  <p>Click the link in the email to verify your account, then return here to login.</p>
+  <Button onClick={() => router.push('/login')}>Go to Login</Button>
+</div>
+```
+
+Step 3 - Email Verification:
+- User checks email inbox (from noreply@desk-mate.it)
+- User clicks verification link in email
+- Supabase verifies email automatically
+- User is redirected back to app via /auth/callback
+
+Step 4 - User Returns and Logs In:
+- User goes to /login page
+- User enters email + password
+- After successful login → redirect to /onboarding
+
+CRITICAL POINTS:
+1. ✅ signUp() automatically triggers verification email (already configured via Resend)
+2. ❌ DON'T auto-login after signup
+3. ❌ DON'T redirect to onboarding before email verification
+4. ✅ Show clear "Check your email" message
+5. ✅ Provide link to go to login page
+6. ✅ Only after verified email + successful login → onboarding
+
+SUPABASE CONFIG:
+Email sending is already configured:
+- SMTP: Resend (smtp.resend.com)
+- Sender: noreply@desk-mate.it
+- Verification emails are sent automatically
+
+Make sure the registration page shows the "Check your email" state and doesn't try to access profiles or user_settings until after login.

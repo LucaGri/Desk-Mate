@@ -1,0 +1,47 @@
+create table public.meetings (
+  id uuid not null default extensions.uuid_generate_v4 (),
+  event_id uuid null,
+  host_user_id uuid not null,
+  title text not null,
+  description text null,
+  daily_room_name text not null,
+  daily_room_url text not null,
+  daily_room_config jsonb null,
+  scheduled_start timestamp with time zone not null,
+  scheduled_end timestamp with time zone not null,
+  actual_start_time timestamp with time zone null,
+  actual_end_time timestamp with time zone null,
+  status public.meeting_status null default 'scheduled'::meeting_status,
+  recording_enabled boolean null default false,
+  max_participants integer null default 10,
+  require_authentication boolean null default false,
+  guest_token text null,
+  guest_token_expires_at timestamp with time zone null,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now(),
+  transcription_enabled boolean null default false,
+  host_meeting_token text null,
+  constraint meetings_pkey primary key (id),
+  constraint meetings_daily_room_name_key unique (daily_room_name),
+  constraint meetings_guest_token_key unique (guest_token),
+  constraint meetings_event_id_fkey foreign KEY (event_id) references calendar_events (id) on delete set null,
+  constraint meetings_host_user_id_fkey foreign KEY (host_user_id) references profiles (id) on delete CASCADE,
+  constraint valid_meeting_time check ((scheduled_end > scheduled_start))
+) TABLESPACE pg_default;
+
+create index IF not exists idx_meetings_host on public.meetings using btree (host_user_id) TABLESPACE pg_default;
+
+create index IF not exists idx_meetings_status on public.meetings using btree (status) TABLESPACE pg_default;
+
+create index IF not exists idx_meetings_scheduled_start on public.meetings using btree (scheduled_start) TABLESPACE pg_default;
+
+create index IF not exists idx_meetings_guest_token on public.meetings using btree (guest_token) TABLESPACE pg_default
+where
+  (guest_token is not null);
+
+create trigger on_meeting_created BEFORE INSERT on meetings for EACH row
+execute FUNCTION generate_meeting_guest_token ();
+
+create trigger update_meetings_updated_at BEFORE
+update on meetings for EACH row
+execute FUNCTION update_updated_at_column ();

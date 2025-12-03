@@ -1,0 +1,215 @@
+import { useEffect, useState, useCallback, useRef } from 'react';
+import { User } from '@supabase/supabase-js';
+import { supabase } from '@/lib/supabase';
+import { Profile, UserSettings } from '@/lib/supabase-types';
+
+export function useAuth() {
+  const [user, setUser] = useState<User | null>(null);
+  const [profile, setProfile] = useState<Profile | null>(null);
+  const [settings, setSettings] = useState<UserSettings | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [profileError, setProfileError] = useState<Error | null>(null);
+  
+  // Ref to track if initial load is done
+  const initialLoadDone = useRef(false);
+  // Ref to prevent concurrent fetches
+  const fetchingRef = useRef(false);
+
+  const fetchProfile = useCallback(async (userId: string, userEmail?: string, userName?: string) => {
+    try {
+      setProfileError(null);
+      const { data: profileData, error } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', userId)
+        .single();
+      
+      if (error) {
+        if (error.code === 'PGRST116') {
+          const { data: currentUser } = await supabase.auth.getUser();
+          const email = userEmail || currentUser.user?.email || '';
+          const fullName = userName || currentUser.user?.user_metadata?.full_name || '';
+          
+          const { data: newProfile, error: insertError } = await supabase
+            .from('profiles')
+            .insert({
+              id: userId,
+              email: email,
+              full_name: fullName,
+              onboarding_completed: false,
+            })
+            .select()
+            .single();
+          
+          if (insertError) {
+            if (insertError.code !== '23505') {
+              setProfileError(new Error(insertError.message));
+              setProfile(null);
+              return null;
+            }
+            const { data: existingProfile } = await supabase
+              .from('profiles')
+              .select('*')
+              .eq('id', userId)
+              .single();
+            setProfile(existingProfile);
+            return existingProfile;
+          }
+          
+          setProfile(newProfile);
+          return newProfile;
+        }
+        
+        setProfileError(new Error(error.message));
+        setProfile(null);
+        return null;
+      }
+      
+      setProfile(profileData);
+      return profileData;
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error('Failed to fetch profile');
+      setProfileError(err);
+      setProfile(null);
+      return null;
+    }
+  }, []);
+
+  const refreshProfile = useCallback(async () => {
+    if (user) {
+      return await fetchProfile(user.id);
+    }
+    return null;
+  }, [user, fetchProfile]);
+
+  const fetchSettings = useCallback(async (userId: string) => {
+    try {
+      const { data: settingsData, error } = await supabase
+        .from('user_settings')
+        .select('*')
+        .eq('user_id', userId)
+        .single();
+      
+      if (error) {
+        if (error.code === 'PGRST116') {
+          setSettings(null);
+          return null;
+        }
+        console.error('Settings fetch error:', error);
+        setSettings(null);
+        return null;
+      }
+      
+      setSettings(settingsData);
+      return settingsData;
+    } catch (error) {
+      console.error('Error fetching settings:', error);
+      setSettings(null);
+      return null;
+    }
+  }, []);
+
+  const refreshSettings = useCallback(async () => {
+    if (user) {
+      return await fetchSettings(user.id);
+    }
+    return null;
+  }, [user, fetchSettings]);
+
+  useEffect(() => {
+    const fetchUserAndProfile = async () => {
+      // Prevent concurrent fetches
+      if (fetchingRef.current) return;
+      fetchingRef.current = true;
+      
+      try {
+        const { data: { session }, error } = await supabase.auth.getSession();
+        
+        if (error) {
+          console.error('Session error:', error);
+          setUser(null);
+          setProfile(null);
+          setLoading(false);
+          initialLoadDone.current = true;
+          fetchingRef.current = false;
+          return;
+        }
+        
+        const currentUser = session?.user ?? null;
+        setUser(currentUser);
+
+        if (currentUser) {
+          await fetchProfile(currentUser.id);
+          await fetchSettings(currentUser.id);
+        } else {
+          setProfile(null);
+          setSettings(null);
+        }
+      } catch (error: any) {
+        console.error('Error fetching user/profile:', error);
+        setUser(null);
+        setProfile(null);
+      } finally {
+        setLoading(false);
+        initialLoadDone.current = true;
+        fetchingRef.current = false;
+      }
+    };
+
+    fetchUserAndProfile();
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
+      console.log('Auth event:', event);
+      
+      // Ignore token refresh events - session is still valid
+      if (event === 'TOKEN_REFRESHED') {
+        // Just update user if needed, don't show loading
+        if (session?.user) {
+          setUser(session.user);
+        }
+        return;
+      }
+      
+      // For INITIAL_SESSION, only process if we haven't done initial load
+      if (event === 'INITIAL_SESSION' && initialLoadDone.current) {
+        return;
+      }
+      
+      // Only show loading for actual auth changes (sign in/out)
+      if (event === 'SIGNED_IN' || event === 'SIGNED_OUT') {
+        // Prevent concurrent fetches
+        if (fetchingRef.current) return;
+        fetchingRef.current = true;
+        
+        // Only set loading if not initial load
+        if (initialLoadDone.current) {
+          setLoading(true);
+        }
+        
+        setUser(session?.user ?? null);
+        
+        try {
+          if (session?.user) {
+            await fetchProfile(session.user.id);
+            await fetchSettings(session.user.id);
+          } else {
+            setProfile(null);
+            setSettings(null);
+            setProfileError(null);
+          }
+        } catch (error) {
+          console.error('Error in auth state change:', error);
+        } finally {
+          setLoading(false);
+          fetchingRef.current = false;
+        }
+      }
+    });
+
+    return () => {
+      subscription.unsubscribe();
+    };
+  }, [fetchProfile, fetchSettings]);
+
+  return { user, profile, settings, loading, profileError, refreshProfile, refreshSettings };
+}

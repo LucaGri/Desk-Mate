@@ -1,0 +1,459 @@
+# Fix: Authentication Loading State Issue
+
+## Problem
+The app gets stuck on "Loading..." screen when switching browser tabs or windows. This happens because:
+1. Each page using `useAuth()` creates a separate Supabase auth subscription
+2. When tab loses focus, `TOKEN_REFRESHED` or `SIGNED_IN` events fire
+3. Multiple subscriptions set `loading: true` simultaneously, causing race conditions
+
+## Solution
+Create a centralized AuthContext so there's only ONE subscription for the entire app.
+
+---
+
+## Step 1: Create AuthContext
+
+Create new file: `client/src/contexts/AuthContext.tsx`
+```tsx
+import { createContext, useContext, useEffect, useState, useCallback, useRef, ReactNode } from 'react';
+import { User } from '@supabase/supabase-js';
+import { supabase } from '@/lib/supabase';
+import { Profile, UserSettings } from '@/lib/supabase-types';
+
+interface AuthContextType {
+  user: User | null;
+  profile: Profile | null;
+  settings: UserSettings | null;
+  loading: boolean;
+  profileError: Error | null;
+  refreshProfile: () => Promise<Profile | null>;
+  refreshSettings: () => Promise<UserSettings | null>;
+  signOut: () => Promise<void>;
+}
+
+const AuthContext = createContext<AuthContextType | undefined>(undefined);
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [user, setUser] = useState<User | null>(null);
+  const [profile, setProfile] = useState<Profile | null>(null);
+  const [settings, setSettings] = useState<UserSettings | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [profileError, setProfileError] = useState<Error | null>(null);
+  
+  const initialLoadDone = useRef(false);
+  const fetchingRef = useRef(false);
+
+  const fetchProfile = useCallback(async (userId: string, userEmail?: string, userName?: string) => {
+    try {
+      setProfileError(null);
+      const { data: profileData, error } = await supabase
+        .from('profiles')
+        .select('*')
+        .eq('id', userId)
+        .single();
+      
+      if (error) {
+        if (error.code === 'PGRST116') {
+          const { data: currentUser } = await supabase.auth.getUser();
+          const email = userEmail || currentUser.user?.email || '';
+          const fullName = userName || currentUser.user?.user_metadata?.full_name || '';
+          
+          const { data: newProfile, error: insertError } = await supabase
+            .from('profiles')
+            .insert({
+              id: userId,
+              email: email,
+              full_name: fullName,
+              onboarding_completed: false,
+            })
+            .select()
+            .single();
+          
+          if (insertError) {
+            if (insertError.code !== '23505') {
+              setProfileError(new Error(insertError.message));
+              setProfile(null);
+              return null;
+            }
+            const { data: existingProfile } = await supabase
+              .from('profiles')
+              .select('*')
+              .eq('id', userId)
+              .single();
+            setProfile(existingProfile);
+            return existingProfile;
+          }
+          
+          setProfile(newProfile);
+          return newProfile;
+        }
+        
+        setProfileError(new Error(error.message));
+        setProfile(null);
+        return null;
+      }
+      
+      setProfile(profileData);
+      return profileData;
+    } catch (error) {
+      const err = error instanceof Error ? error : new Error('Failed to fetch profile');
+      setProfileError(err);
+      setProfile(null);
+      return null;
+    }
+  }, []);
+
+  const fetchSettings = useCallback(async (userId: string) => {
+    try {
+      const { data: settingsData, error } = await supabase
+        .from('user_settings')
+        .select('*')
+        .eq('user_id', userId)
+        .single();
+      
+      if (error) {
+        if (error.code === 'PGRST116') {
+          setSettings(null);
+          return null;
+        }
+        setSettings(null);
+        return null;
+      }
+      
+      setSettings(settingsData);
+      return settingsData;
+    } catch (error) {
+      setSettings(null);
+      return null;
+    }
+  }, []);
+
+  const refreshProfile = useCallback(async () => {
+    if (user) {
+      return await fetchProfile(user.id);
+    }
+    return null;
+  }, [user, fetchProfile]);
+
+  const refreshSettings = useCallback(async () => {
+    if (user) {
+      return await fetchSettings(user.id);
+    }
+    return null;
+  }, [user, fetchSettings]);
+
+  const signOut = useCallback(async () => {
+    await supabase.auth.signOut();
+    setUser(null);
+    setProfile(null);
+    setSettings(null);
+    setProfileError(null);
+  }, []);
+
+  useEffect(() => {
+    let mounted = true;
+
+    const initializeAuth = async () => {
+      if (fetchingRef.current) return;
+      fetchingRef.current = true;
+      
+      try {
+        const { data: { session } } = await supabase.auth.getSession();
+        
+        if (!mounted) return;
+        
+        const currentUser = session?.user ?? null;
+        setUser(currentUser);
+
+        if (currentUser) {
+          await fetchProfile(currentUser.id);
+          await fetchSettings(currentUser.id);
+        }
+      } catch (error) {
+        console.error('Auth init error:', error);
+      } finally {
+        if (mounted) {
+          setLoading(false);
+          initialLoadDone.current = true;
+          fetchingRef.current = false;
+        }
+      }
+    };
+
+    initializeAuth();
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
+      // Skip if not mounted or still doing initial load
+      if (!mounted || !initialLoadDone.current) {
+        return;
+      }
+      
+      // Skip if already fetching to prevent race conditions
+      if (fetchingRef.current) {
+        return;
+      }
+      
+      // IGNORE token refresh events - session is still valid, no action needed
+      if (event === 'TOKEN_REFRESHED') {
+        if (session?.user) {
+          setUser(session.user);
+        }
+        return;
+      }
+      
+      // Handle sign out
+      if (event === 'SIGNED_OUT') {
+        setUser(null);
+        setProfile(null);
+        setSettings(null);
+        setProfileError(null);
+        return;
+      }
+      
+      // Handle sign in
+      if (event === 'SIGNED_IN' && session?.user) {
+        fetchingRef.current = true;
+        setUser(session.user);
+        
+        try {
+          await fetchProfile(session.user.id);
+          await fetchSettings(session.user.id);
+        } catch (error) {
+          console.error('Error fetching profile on sign in:', error);
+        } finally {
+          fetchingRef.current = false;
+        }
+      }
+    });
+
+    return () => {
+      mounted = false;
+      subscription.unsubscribe();
+    };
+  }, [fetchProfile, fetchSettings]);
+
+  return (
+    <AuthContext.Provider value={{
+      user,
+      profile,
+      settings,
+      loading,
+      profileError,
+      refreshProfile,
+      refreshSettings,
+      signOut,
+    }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth() {
+  const context = useContext(AuthContext);
+  if (context === undefined) {
+    throw new Error('useAuth must be used within an AuthProvider');
+  }
+  return context;
+}
+```
+
+---
+
+## Step 2: Update App.tsx
+
+Replace the entire content of `client/src/App.tsx` with:
+```tsx
+import { useEffect } from "react";
+import { Switch, Route } from "wouter";
+import { queryClient } from "./lib/queryClient";
+import { QueryClientProvider } from "@tanstack/react-query";
+import { Toaster } from "@/components/ui/toaster";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { AuthProvider, useAuth } from "@/contexts/AuthContext";
+import Home from "@/pages/home";
+import Auth from "@/pages/auth";
+import Onboarding from "@/pages/onboarding";
+import Dashboard from "@/pages/dashboard";
+import CalendarPage from "@/pages/calendar";
+import ProfilePage from "@/pages/profile";
+import SharedEventPage from "@/pages/shared-event";
+import NotFound from "@/pages/not-found";
+
+function Router() {
+  return (
+    <Switch>
+      <Route path="/" component={Home} />
+      <Route path="/auth" component={Auth} />
+      <Route path="/onboarding" component={Onboarding} />
+      <Route path="/dashboard" component={Dashboard} />
+      <Route path="/calendar" component={CalendarPage} />
+      <Route path="/profile" component={ProfilePage} />
+      <Route path="/event/:token" component={SharedEventPage} />
+      <Route component={NotFound} />
+    </Switch>
+  );
+}
+
+function ThemeHandler() {
+  const { profile } = useAuth();
+
+  useEffect(() => {
+    const savedTheme = localStorage.getItem('theme') as 'light' | 'dark' | 'system' | null;
+    const theme = profile?.theme || savedTheme || 'system';
+    
+    const root = document.documentElement;
+    if (theme === 'system') {
+      const systemDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+      root.classList.toggle('dark', systemDark);
+    } else {
+      root.classList.toggle('dark', theme === 'dark');
+    }
+    
+    if (profile?.theme) {
+      localStorage.setItem('theme', profile.theme);
+    }
+  }, [profile]);
+
+  useEffect(() => {
+    const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)');
+    const handleChange = () => {
+      const savedTheme = localStorage.getItem('theme');
+      if (savedTheme === 'system' || !savedTheme) {
+        document.documentElement.classList.toggle('dark', mediaQuery.matches);
+      }
+    };
+    
+    mediaQuery.addEventListener('change', handleChange);
+    return () => mediaQuery.removeEventListener('change', handleChange);
+  }, []);
+
+  return null;
+}
+
+function App() {
+  return (
+    <QueryClientProvider client={queryClient}>
+      <AuthProvider>
+        <TooltipProvider>
+          <ThemeHandler />
+          <Toaster />
+          <Router />
+        </TooltipProvider>
+      </AuthProvider>
+    </QueryClientProvider>
+  );
+}
+
+export default App;
+```
+
+---
+
+## Step 3: Update supabase.ts
+
+Update `client/src/lib/supabase.ts` with better auth config:
+```typescript
+import { createClient } from '@supabase/supabase-js';
+
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+
+if (!supabaseUrl || !supabaseAnonKey) {
+  throw new Error('Missing Supabase environment variables');
+}
+
+export const supabase = createClient(supabaseUrl, supabaseAnonKey, {
+  auth: {
+    persistSession: true,
+    autoRefreshToken: true,
+    detectSessionInUrl: true,
+    storageKey: 'timeflow-auth',
+  },
+  db: {
+    schema: 'public',
+  },
+});
+```
+
+---
+
+## Step 4: Update ALL imports in pages
+
+In EVERY file that imports useAuth, change the import from:
+```typescript
+import { useAuth } from "@/hooks/useAuth";
+```
+
+TO:
+```typescript
+import { useAuth } from "@/contexts/AuthContext";
+```
+
+Files to update (search for "from \"@/hooks/useAuth\""):
+- client/src/pages/dashboard.tsx
+- client/src/pages/calendar.tsx
+- client/src/pages/profile.tsx
+- client/src/pages/onboarding.tsx
+- client/src/pages/auth.tsx (if it uses useAuth)
+- Any other files using useAuth
+
+---
+
+## Step 5: Update dashboard.tsx signOut
+
+In `client/src/pages/dashboard.tsx`, update the handleSignOut function to use the context's signOut:
+```typescript
+// Change this:
+const handleSignOut = async () => {
+  await supabase.auth.signOut();
+  toast({
+    title: "Signed out",
+    description: "You have been successfully signed out.",
+  });
+  setLocation("/");
+};
+
+// To this:
+const { user, profile, loading, profileError, signOut } = useAuth();
+
+const handleSignOut = async () => {
+  await signOut();
+  toast({
+    title: "Signed out",
+    description: "You have been successfully signed out.",
+  });
+  setLocation("/");
+};
+```
+
+And remove the direct supabase import if no longer needed:
+```typescript
+// Remove this line if supabase is only used for signOut:
+import { supabase } from "@/lib/supabase";
+```
+
+---
+
+## Step 6: Delete old useAuth hook
+
+After all imports are updated, delete the file:
+`client/src/hooks/useAuth.tsx`
+
+---
+
+## Summary of Changes
+
+| File | Action |
+|------|--------|
+| `client/src/contexts/AuthContext.tsx` | CREATE - centralized auth provider |
+| `client/src/App.tsx` | UPDATE - wrap with AuthProvider |
+| `client/src/lib/supabase.ts` | UPDATE - add auth config |
+| `client/src/pages/*.tsx` | UPDATE - change useAuth import |
+| `client/src/hooks/useAuth.tsx` | DELETE - no longer needed |
+
+## Why This Fixes The Issue
+
+1. **Single Subscription**: Only AuthProvider listens to auth events
+2. **No Loading on Token Refresh**: TOKEN_REFRESHED events are ignored (session is still valid)
+3. **Race Condition Prevention**: fetchingRef prevents concurrent fetches
+4. **Proper Cleanup**: mounted flag prevents state updates after unmount
